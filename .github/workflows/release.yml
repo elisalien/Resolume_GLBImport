@@ -1,0 +1,138 @@
+name: Release
+
+# Tag a commit to cut a release:
+#   git tag -a v1.0.0 -m "v1.0.0" && git push origin v1.0.0
+on:
+  push:
+    tags: [ 'v*' ]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: 'Version to package, without the leading v (dry run, no release)'
+        required: true
+        default: '0.0.0-test'
+
+jobs:
+  # ---------------------------------------------------------------- Windows
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: v
+        shell: bash
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        run: |
+          cmake -B build -A x64
+          cmake --build build --config Release --parallel
+
+      - name: Package
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $name = "GlbSource-$env:VERSION-win64"
+          New-Item -ItemType Directory -Path $name | Out-Null
+          Copy-Item build/Release/GlbSource.dll   $name/
+          Copy-Item packaging/windows/install.ps1 $name/
+          Copy-Item packaging/windows/installer.bat $name/
+          Copy-Item packaging/windows/LISEZMOI.md $name/
+          Copy-Item LICENSE                       $name/
+          Copy-Item THIRD_PARTY.md                $name/
+          Compress-Archive -Path $name -DestinationPath "$name.zip"
+          Get-ChildItem "$name.zip" | Format-List Name, Length
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: '*.zip'
+          if-no-files-found: error
+
+  # ------------------------------------------------------------------ macOS
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Work out the version
+        id: v
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=${{ github.event.inputs.version }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Build
+        run: |
+          cmake -B build -DCMAKE_BUILD_TYPE=Release
+          cmake --build build --config Release --parallel
+
+      - name: Check the bundle is universal
+        run: |
+          BIN=build/GlbSource.bundle/Contents/MacOS/GlbSource
+          ARCHS=$(lipo -archs "$BIN")
+          echo "architectures: $ARCHS"
+          case "$ARCHS" in *arm64*) ;; *) echo "arm64 slice missing"; exit 1 ;; esac
+          case "$ARCHS" in *x86_64*) ;; *) echo "x86_64 slice missing"; exit 1 ;; esac
+
+      - name: Package
+        env:
+          VERSION: ${{ steps.v.outputs.version }}
+        run: |
+          set -e
+          NAME="GlbSource-${VERSION}-macos-universal"
+          mkdir "$NAME"
+          # ditto rather than cp keeps the bundle's structure and metadata intact
+          ditto build/GlbSource.bundle "$NAME/GlbSource.bundle"
+          cp packaging/macos/installer.command "$NAME/"
+          cp packaging/macos/LISEZMOI.md       "$NAME/"
+          cp LICENSE THIRD_PARTY.md            "$NAME/"
+          chmod +x "$NAME/installer.command"
+          # ditto -c -k is the archiver that preserves bundle layout and the +x bit
+          ditto -c -k --sequesterRsrc --keepParent "$NAME" "$NAME.zip"
+          ls -la "$NAME.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: '*.zip'
+          if-no-files-found: error
+
+  # ---------------------------------------------------------------- release
+  release:
+    needs: [ windows, macos ]
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Collect the archives
+        run: |
+          mkdir -p out
+          find artifacts -name '*.zip' -exec mv {} out/ \;
+          ls -la out
+
+      - name: Publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          gh release create "$GITHUB_REF_NAME" out/*.zip \
+            --title "GLB Model Source $VERSION" \
+            --notes-file .github/release-notes.md

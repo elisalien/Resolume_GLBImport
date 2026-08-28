@@ -1,0 +1,65 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, name: Windows x64 }
+          - { os: macos-latest,   name: macOS universal }
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure (Windows)
+        if: runner.os == 'Windows'
+        run: cmake -B build -A x64
+
+      - name: Configure (macOS)
+        if: runner.os == 'macOS'
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --config Release --parallel
+
+      - name: Check the Windows plugin exports plugMain
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $dll = 'build/Release/GlbSource.dll'
+          if ( -not (Test-Path $dll) ) { throw "GlbSource.dll was not produced" }
+          # Resolume looks for this export; without it the plugin is skipped silently.
+          $dumpbin = Get-ChildItem -Recurse -Filter dumpbin.exe `
+                     "${env:ProgramFiles}\Microsoft Visual Studio" -ErrorAction SilentlyContinue |
+                     Select-Object -First 1
+          if ( $dumpbin ) {
+            $exports = & $dumpbin.FullName /exports $dll
+            if ( $exports -notmatch 'plugMain' ) { throw "plugMain is not exported" }
+            Write-Host "plugMain is exported"
+          } else {
+            Write-Host "dumpbin not found, skipping the export check"
+          }
+
+      - name: Check the macOS bundle is universal
+        if: runner.os == 'macOS'
+        run: |
+          BIN=build/GlbSource.bundle/Contents/MacOS/GlbSource
+          test -f "$BIN" || { echo "the bundle was not produced"; exit 1; }
+          ARCHS=$(lipo -archs "$BIN")
+          echo "architectures: $ARCHS"
+          # Resolume 7.11+ runs natively on Apple Silicon and refuses Intel-only plugins.
+          case "$ARCHS" in
+            *arm64*) ;; *) echo "arm64 slice missing"; exit 1 ;;
+          esac
+          case "$ARCHS" in
+            *x86_64*) ;; *) echo "x86_64 slice missing"; exit 1 ;;
+          esac
