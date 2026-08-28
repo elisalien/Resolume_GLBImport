@@ -128,11 +128,27 @@ jobs:
           find artifacts -name '*.zip' -exec mv {} out/ \;
           ls -la out
 
+      - name: Checksums
+        run: |
+          cd out
+          sha256sum *.zip | tee SHA256SUMS.txt
+
+      - name: Assemble the release notes
+        run: |
+          {
+            cat .github/release-notes.md
+            printf '\n## Checksums\n\n```\n'
+            cat out/SHA256SUMS.txt
+            printf '```\n'
+          } > notes.md
+          echo "--- notes.md ---"
+          tail -12 notes.md
+
       - name: Publish
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           VERSION="${GITHUB_REF_NAME#v}"
-          gh release create "$GITHUB_REF_NAME" out/*.zip \
+          gh release create "$GITHUB_REF_NAME" out/* \
             --title "GLB Model Source $VERSION" \
-            --notes-file .github/release-notes.md
+            --notes-file notes.md
