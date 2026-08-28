@@ -181,4 +181,3 @@ is a documented plugin interface, the same situation as the many GPL audio plugi
 that load into proprietary hosts. It does mean that if you distribute a modified
 version of *this plugin*, you distribute its source under the same licence.
 
-Built by [Elisalien](https://github.com/elisalien).
