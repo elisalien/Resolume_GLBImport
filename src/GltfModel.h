@@ -4,15 +4,22 @@
 
 #pragma once
 #include "GLHeaders.h"
+#include <map>
+#include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 #include "Math3D.h"
 
-/// Loads a .glb / .gltf file, keeps a CPU copy for on-demand decimation,
-/// samples node animations, and owns the GPU buffers used for drawing.
+/// A glTF model split in two halves:
 ///
-/// Everything that touches OpenGL (Upload / Release / vao ids) must be called
-/// on the host's GL context, i.e. from InitGL / ProcessOpenGL / DeInitGL.
+/// - GltfModel::Asset holds everything parsed out of the file (geometry,
+///   decoded textures, rest pose, animations). It is immutable once built,
+///   lives in a process-wide cache and is shared between plugin instances and
+///   worker threads. Building one never touches OpenGL.
+/// - GltfModel itself is one instance's view of an asset: the animated pose
+///   and the GL objects. Everything that touches OpenGL (UploadStep / Release /
+///   ApplyIndices) must be called on the host's GL context.
 class GltfModel
 {
 public:
@@ -47,9 +54,9 @@ public:
 		int texEmissive      = -1;
 	};
 
-	struct Primitive
+	/// CPU geometry of one glTF triangle primitive.
+	struct Mesh
 	{
-		GLuint vao = 0, vbo = 0, ibo = 0;
 		int material = -1;
 		int node     = -1;//node this primitive is attached to
 		int skin     = -1;//index into skins, -1 when not skinned
@@ -62,8 +69,20 @@ public:
 		std::vector< float > weldedPos;
 		std::vector< unsigned int > weldedIdx;
 		std::vector< unsigned int > representative;//welded index -> original vertex index
+	};
 
-		GLsizei activeIndexCount = 0;//index count currently in the GPU index buffer
+	struct Level
+	{
+		int width = 0, height = 0;
+		std::vector< unsigned char > pixels;//RGBA8
+	};
+
+	/// A decoded texture with its full mip chain, built on the loading thread:
+	/// glGenerateMipmap on a 4K texture can stall the GPU for tens of ms.
+	struct Image
+	{
+		bool srgb = false;
+		std::vector< Level > levels;//empty when the image could not be decoded
 	};
 
 	struct Node
@@ -115,23 +134,58 @@ public:
 		float duration = 0.0f;
 	};
 
-	GltfModel() = default;
-	~GltfModel();
+	/// One index buffer per mesh, for a given density.
+	typedef std::vector< std::vector< unsigned int > > IndexSet;
 
-	/// Parses the file and prepares CPU-side geometry. No GL calls, safe to fail.
-	/// Returns false and fills lastError() when the file cannot be used.
-	bool Load( const std::string& path );
-	/// Creates the GL objects for the geometry currently held on the CPU.
-	bool Upload();
+	/// Everything parsed out of one file. Read-only once built.
+	struct Asset
+	{
+		std::string path;
+		std::vector< Mesh > meshes;
+		std::vector< Material > materials;
+		std::vector< Image > images;
+		std::vector< Node > nodes;//rest pose, globals already computed
+		std::vector< int > roots;
+		std::vector< Skin > skins;
+		std::vector< Animation > animations;
+
+		m3d::Vec3 boundsCenter;
+		float boundsRadius   = 1.0f;
+		size_t trianglesFull = 0;
+		size_t gpuBytes      = 0;//vertex + index + texture bytes, for the log
+
+		/// Simplified index buffers at the given density (]0,1[). Pure CPU and
+		/// thread safe; the last few results are memoised so retriggering a
+		/// decimated clip does not run the simplifier again.
+		std::shared_ptr< const IndexSet > Decimate( float density ) const;
+
+	private:
+		mutable std::mutex decimateMutex;
+		mutable std::vector< std::pair< int, std::shared_ptr< const IndexSet > > > decimated;
+	};
+
+	/// Parses a file, or hands back the cached asset when the same file (same
+	/// size and modification time) was already loaded. Thread safe, no GL.
+	/// forceReload skips the cache. Returns nullptr and fills error on failure.
+	static std::shared_ptr< const Asset > Acquire( const std::string& path, bool forceReload, std::string& error );
+
+	/// Points this instance at an asset and resets the pose. No GL calls; the
+	/// GPU side is created afterwards by UploadStep. indices is the initial
+	/// density (nullptr = full resolution).
+	void Adopt( std::shared_ptr< const Asset > asset, std::shared_ptr< const IndexSet > indices );
+	/// Sends pending GPU data in small chunks until about budgetMs of render
+	/// thread time is used, so a big model is spread over several frames
+	/// instead of stalling one. Returns true once everything is on the GPU.
+	bool UploadStep( double budgetMs );
+	bool IsUploaded() const { return uploaded; }
+
+	/// Swaps the index buffers (nullptr = full resolution). GL thread only.
+	void ApplyIndices( const IndexSet* set );
+
 	/// Frees every GL object. Safe to call more than once.
 	void Release();
-	/// Drops CPU and GPU data entirely.
+	/// Frees GL objects and drops the asset.
 	void Clear();
-
-	/// Rebuilds every primitive's index buffer at the requested density.
-	/// density is in ]0,1]; 1 keeps the original triangles.
-	void SetDensity( float density );
-	float Density() const { return currentDensity; }
 
 	/// Applies the animation clip at the given time and recomputes node
 	/// world transforms + joint matrices. clip < 0 leaves the rest pose.
@@ -142,51 +196,45 @@ public:
 	const float* JointData( int skinIndex ) const;
 	int JointCount( int skinIndex ) const;
 
-	bool IsLoaded() const { return loaded; }
-	const std::string& LastError() const { return lastError; }
-	const std::string& SourcePath() const { return sourcePath; }
+	/// Per-instance GL handles for one mesh.
+	struct Primitive
+	{
+		GLuint vao = 0, vbo = 0, ibo = 0;
+		int material = -1;
+		int node     = -1;
+		int skin     = -1;
+		GLsizei activeIndexCount = 0;//index count currently in the GPU index buffer
+	};
+
+	bool IsLoaded() const { return asset != nullptr && uploaded; }
+	const std::shared_ptr< const Asset >& GetAsset() const { return asset; }
 
 	const std::vector< Primitive >& Primitives() const { return primitives; }
-	const std::vector< Material >& Materials() const { return materials; }
+	const std::vector< Material >& Materials() const;
 	const std::vector< Node >& Nodes() const { return nodes; }
-	const std::vector< Animation >& Animations() const { return animations; }
+	const std::vector< Animation >& Animations() const;
 	GLuint TextureId( int index ) const;
 
-	m3d::Vec3 BoundsCenter() const { return boundsCenter; }
-	float BoundsRadius() const { return boundsRadius; }
-	size_t TriangleCountFull() const { return trianglesFull; }
+	m3d::Vec3 BoundsCenter() const { return asset ? asset->boundsCenter : m3d::Vec3(); }
+	float BoundsRadius() const { return asset ? asset->boundsRadius : 1.0f; }
+	size_t TriangleCountFull() const { return asset ? asset->trianglesFull : 0; }
 	size_t TriangleCountActive() const;
 
 private:
-	struct TextureSlot
-	{
-		GLuint id = 0;
-		int width = 0, height = 0, channels = 0;
-		std::vector< unsigned char > pixels;//kept until Upload()
-		bool srgb = false;
-	};
-
-	void BuildWeldedStreams( Primitive& prim );
-	void ComputeBounds();
 	void UpdateGlobalTransforms();
 	void UpdateJointMatrices();
 
-	bool loaded = false;
-	std::string lastError;
-	std::string sourcePath;
+	std::shared_ptr< const Asset > asset;
+	std::shared_ptr< const IndexSet > pendingIndices;//density to upload with
 
 	std::vector< Primitive > primitives;
-	std::vector< Material > materials;
-	std::vector< TextureSlot > textures;
+	std::vector< GLuint > textures;
 	std::vector< Node > nodes;
-	std::vector< int > roots;
-	std::vector< Skin > skins;
-	std::vector< Animation > animations;
 	std::vector< std::vector< float > > jointMatrices;//per skin, 16 floats per joint
 
-	m3d::Vec3 boundsCenter;
-	float boundsRadius   = 1.0f;
-	size_t trianglesFull = 0;
-	float currentDensity = 1.0f;
-	bool uploaded        = false;
+	// upload cursor: primitives first, then images
+	size_t uploadItem   = 0;
+	size_t uploadOffset = 0;//bytes (buffers) or rows (images) already sent
+	int uploadStage     = 0;//per primitive: 0 vertices, 1 indices; per image: mip level
+	bool uploaded       = false;
 };

@@ -45,10 +45,14 @@ Then: **Effects panel → Sources tab → GLB Model Source** → drag into a cli
 **Model** — `Model File` (native file browser, filtered to glb/gltf), `Reload`,
 `Mesh Density`, `Auto Fit`.
 
-`Mesh Density` re-runs the decimation and rebuilds the index buffers once, when
-you move it — not every frame. The value readout under the slider shows the real
-triangle count, which is also the best way to tell whether a given mesh actually
-simplifies.
+`Mesh Density` re-runs the decimation on a background thread when you move it —
+not every frame — and swaps the index buffers in when it is done, so dragging the
+slider never stalls the output. The last few densities per file are remembered.
+The value readout under the slider shows the real triangle count, which is also
+the best way to tell whether a given mesh actually simplifies.
+
+`Reload` re-reads the file from disk. A file re-exported over the old one is
+also picked up on the next trigger without it.
 
 **Transform** — `Scale`, `Rotation X/Y/Z`, `Spin X/Y/Z` (turns per second),
 `Position X/Y`, `Camera Distance`, `Field Of View`.
@@ -129,9 +133,21 @@ has to be computed in the fragment shader. It matters when you are projecting.
 `GL_SRGB8_ALPHA8` so sampling linearises them, glTF factors are already linear,
 lighting runs in linear space, and the fragment shader encodes back to sRGB.
 
-**Loading never touches OpenGL.** Parsing can fail cleanly; the GPU upload happens
-on the render thread. A large `.glb` costs one frame. Errors and load confirmations
-go to the Resolume console (`Ctrl+Shift+L`, `Cmd+Shift+L` on macOS).
+**Triggering a clip never freezes the output.** Resolume creates a fresh plugin
+instance each time a clip is triggered, so everything expensive is kept off that
+moment:
+
+- parsing, texture decoding, mipmap generation and decimation run on a worker
+  thread; the clip stays transparent until the model is ready;
+- the GPU upload is spread over frames in 4 MB chunks, about 5 ms per frame;
+- parsed files live in a process-wide cache (keyed on path, size and modification
+  time, the 6 most recent kept up to ~1.5 GB of RAM), so retriggering a clip or
+  using the same file in several clips skips the parse entirely;
+- shader programs are compiled once per GL context and shared by every instance;
+- stopping a clip mid-load drops the job without waiting for it.
+
+Errors and load confirmations go to the Resolume console (`Ctrl+Shift+L`,
+`Cmd+Shift+L` on macOS).
 
 Every GL entry point used has been checked against the OpenGL 4.1 core profile —
 macOS's ceiling — so the same source builds and runs on both platforms.
@@ -143,7 +159,8 @@ src/ParamIds.h          parameter indices — never reorder after a comp is save
 src/Math3D.h            vec3 / quat / mat4, column-major, no dependencies
 src/ColorUtils.h        Resolume HSB -> linear RGB
 src/Shaders.h           all GLSL (shared vertex, PBR, wireframe GS, points, blit)
-src/GltfModel.*         cgltf parsing, welding, decimation, animation, skinning
+src/GltfModel.*         cgltf parsing, asset cache, welding, decimation, staged upload, animation, skinning
+src/AsyncJob.h          background jobs the render thread polls without ever blocking on
 src/GlbSource.*         FFGL plugin: parameters, programs, render target, audio
 src/GlbSourceRender.cpp render passes, blit, ProcessOpenGL, parameter accessors
 ```
