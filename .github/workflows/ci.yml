@@ -43,7 +43,8 @@ jobs:
                      Select-Object -First 1
           if ( $dumpbin ) {
             $exports = & $dumpbin.FullName /exports $dll
-            if ( $exports -notmatch 'plugMain' ) { throw "plugMain is not exported" }
+            # -match on an array filters it; an empty result means no line matched.
+            if ( -not ( $exports -match 'plugMain' ) ) { throw "plugMain is not exported" }
             Write-Host "plugMain is exported"
           } else {
             Write-Host "dumpbin not found, skipping the export check"

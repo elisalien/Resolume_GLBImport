@@ -4,6 +4,24 @@ and putting every parameter under Resolume's audio analysis.
 
 Not an effect layered onto a clip. A real source you drop into an empty slot.
 
+## What's new in 1.1
+
+**No more freeze when you trigger a clip.** 1.0 loaded the whole model inside a
+single frame of Resolume's render thread, which froze the output for up to a
+couple of seconds on big files. Now:
+
+- the file is parsed, its textures decoded and its mesh decimated on a
+  background thread — the clip stays transparent until the model is ready;
+- the GPU upload is spread over frames, a few milliseconds each;
+- files stay cached, so retriggering a clip (or using the same `.glb` in several
+  clips) skips the loading, and a file re-exported on disk is picked up;
+- moving `Mesh Density` no longer hitches, and shaders compile once instead of on
+  every trigger.
+
+Measured on a 95 MB / 18-texture `.glb`: worst frame on trigger went from about
+2 s to under 10 ms. Nothing changes in the parameters — existing compositions
+open as before.
+
 ## Download
 
 | Platform | File | Notes |
@@ -55,8 +73,9 @@ embedded or sidecar textures, `OPAQUE` and `MASK` alpha.
 `CUBICSPLINE`, with GPU skinning up to 128 joints. `Anim Speed` runs from -4 to 4,
 so backwards is a parameter, not a trick.
 
-**Decimates on load.** `Mesh Density` rebuilds the index buffers once, when you
-move it — not every frame, so it costs nothing during a set. The readout under the
+**Decimates on load.** `Mesh Density` simplifies the mesh in the background when
+you move it — not every frame, and never on the render thread, so it costs
+nothing during a set. The readout under the
 slider is the real triangle count.
 
 **Four render modes, stackable.** Shaded PBR, flat low-poly, unlit, wireframe-only
