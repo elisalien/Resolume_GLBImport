@@ -8,7 +8,7 @@ if( APPLE AND NOT DEFINED CMAKE_OSX_DEPLOYMENT_TARGET )
     set( CMAKE_OSX_DEPLOYMENT_TARGET "10.15" CACHE STRING "" )
 endif()
 
-project( GlbSource VERSION 1.0 LANGUAGES CXX C )
+project( GlbSource VERSION 1.1 LANGUAGES CXX C )
 
 # ---------------------------------------------------------------------------
 # Resolume FFGL SDK
@@ -49,6 +49,7 @@ add_library( GlbSource MODULE
     src/GlbSourceRender.cpp
     src/GltfModel.cpp
     src/GlbSource.h
+    src/AsyncJob.h
     src/GltfModel.h
     src/GLHeaders.h
     src/Math3D.h

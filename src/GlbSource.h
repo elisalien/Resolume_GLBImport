@@ -4,14 +4,21 @@
 
 #pragma once
 #include <FFGLSDK.h>
+#include <atomic>
+#include <memory>
 #include <mutex>
 #include <string>
 #include <vector>
+#include "AsyncJob.h"
 #include "GltfModel.h"
 #include "Math3D.h"
 
 /// FFGL 2.2 source plugin: loads a .glb / .gltf model, decimates it on load,
 /// plays its animation clips and exposes transform / look / audio parameters.
+///
+/// Nothing heavy runs on the render thread: files are parsed and decimated on
+/// worker threads, then uploaded to the GPU a few megabytes per frame, while
+/// the previous model (or nothing, on a fresh clip) keeps being drawn.
 class GlbSource : public CFFGLPlugin
 {
 public:
@@ -53,8 +60,30 @@ private:
 	void PublishClipNames();
 	m3d::Mat4 BaseTransform() const;
 
+	struct LoadResult
+	{
+		std::shared_ptr< const GltfModel::Asset > asset;
+		std::shared_ptr< const GltfModel::IndexSet > indices;//nullptr = full density
+		float density = 1.0f;
+		std::string path;
+		std::string error;
+	};
+
+	void UpdateDensity();
+
 	// state ---------------------------------------------------------------
-	GltfModel model;
+	GltfModel model;  //what is drawn
+	GltfModel staging;//next model, uploading over several frames
+	bool stagingActive   = false;
+	float stagingDensity = 1.0f;
+	std::string stagingPath;
+	AsyncJob< LoadResult > loadJob;
+
+	AsyncJob< std::shared_ptr< const GltfModel::IndexSet > > densityJob;
+	std::shared_ptr< const GltfModel::Asset > densityJobAsset;
+	float densityJobValue = 1.0f;
+	std::atomic< int > displayTriangles{ 0 };//read by the host's ui thread
+
 	RenderTarget target;
 
 	GLuint solidProgram = 0;
@@ -71,6 +100,7 @@ private:
 	std::string filePath;   //what the host gave us
 	std::string loadedPath; //what is actually in memory
 	bool loadRequested = false;
+	bool forceReload   = false;//Reload pressed: bypass the asset cache
 	int publishedClipCount = -1;
 
 	float lastHostTime = 0.0f;

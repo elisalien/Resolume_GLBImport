@@ -8,9 +8,16 @@
 
 #include <algorithm>
 #include <cmath>
+#include <map>
 #include <mutex>
 #include <cstdio>
 #include <cstring>
+
+#if defined( _WIN32 )
+#	include <windows.h>
+#elif defined( __APPLE__ )
+#	include <OpenGL/OpenGL.h>
+#endif
 
 using namespace m3d;
 
@@ -19,7 +26,7 @@ static CFFGLPluginInfo PluginInfo(
 	"EL3D",                                   // unique 4 character id
 	"GLB Model Source",                       // name shown in Resolume
 	2, 2,                                     // FFGL api version
-	1, 0,                                     // plugin version
+	1, 1,                                     // plugin version
 	FF_SOURCE,
 	"Loads a .glb / .gltf model, decimates it and animates it. Every parameter can be driven by Resolume's audio analysis.",
 	"Elisalien" );
@@ -109,6 +116,42 @@ GLuint LinkProgram( const char* vertex, const char* geometry, const char* fragme
 		glDeleteShader( gs );
 	glDeleteShader( fs );
 	return program;
+}
+
+/// Render thread time a staging model may use per frame for its upload:
+/// a third of a 60 fps frame, so the show keeps running while it lands.
+const double kUploadMsPerFrame = 5.0;
+
+/// Programs, the blit quad and the white texture are identical for every
+/// instance, and Resolume makes a new instance each time a clip is triggered.
+/// Compiling them once per GL context (the geometry shader especially) takes
+/// that cost out of the trigger. They live as long as the plugin is loaded.
+struct SharedGL
+{
+	GLuint solid = 0, wire = 0, point = 0, quad = 0;
+	GLuint quadVao = 0, quadVbo = 0, white = 0;
+};
+
+void* CurrentContextKey()
+{
+#if defined( _WIN32 )
+	return (void*)wglGetCurrentContext();
+#elif defined( __APPLE__ )
+	return (void*)CGLGetCurrentContext();
+#else
+	return nullptr;
+#endif
+}
+
+std::mutex& SharedMutex()
+{
+	static std::mutex m;
+	return m;
+}
+std::map< void*, SharedGL >& SharedByContext()
+{
+	static std::map< void*, SharedGL > shared;
+	return shared;
 }
 }//namespace
 
@@ -244,51 +287,70 @@ GlbSource::~GlbSource() = default;
 
 bool GlbSource::BuildPrograms()
 {
-	solidProgram = LinkProgram( shaders::kModelVertex, nullptr, shaders::kModelFragment );
-	wireProgram  = LinkProgram( shaders::kModelVertex, shaders::kWireGeometry, shaders::kWireFragment );
-	pointProgram = LinkProgram( shaders::kModelVertex, nullptr, shaders::kPointFragment );
-	quadProgram  = LinkProgram( shaders::kQuadVertex, nullptr, shaders::kQuadFragment );
+	std::lock_guard< std::mutex > lock( SharedMutex() );
+	SharedGL& shared = SharedByContext()[ CurrentContextKey() ];
 
-	if( !solidProgram || !wireProgram || !pointProgram || !quadProgram )
-		return false;
+	// A context can be torn down and a new one handed the same address, so
+	// make sure the cached names still mean something before reusing them.
+	const bool reusable = shared.solid && glIsProgram( shared.solid ) && glIsProgram( shared.wire ) &&
+	                      glIsProgram( shared.point ) && glIsProgram( shared.quad ) &&
+	                      glIsVertexArray( shared.quadVao ) && glIsTexture( shared.white );
+	if( !reusable )
+	{
+		shared = SharedGL();
+		shared.solid = LinkProgram( shaders::kModelVertex, nullptr, shaders::kModelFragment );
+		shared.wire  = LinkProgram( shaders::kModelVertex, shaders::kWireGeometry, shaders::kWireFragment );
+		shared.point = LinkProgram( shaders::kModelVertex, nullptr, shaders::kPointFragment );
+		shared.quad  = LinkProgram( shaders::kQuadVertex, nullptr, shaders::kQuadFragment );
 
-	static const float quadVertices[] = {
-		-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f//oversized triangle, covers the screen
-	};
-	glGenVertexArrays( 1, &quadVao );
-	glGenBuffers( 1, &quadVbo );
-	glBindVertexArray( quadVao );
-	glBindBuffer( GL_ARRAY_BUFFER, quadVbo );
-	glBufferData( GL_ARRAY_BUFFER, sizeof( quadVertices ), quadVertices, GL_STATIC_DRAW );
-	glEnableVertexAttribArray( 0 );
-	glVertexAttribPointer( 0, 2, GL_FLOAT, GL_FALSE, sizeof( float ) * 2, (void*)0 );
-	glBindVertexArray( 0 );
-	glBindBuffer( GL_ARRAY_BUFFER, 0 );
+		if( !shared.solid || !shared.wire || !shared.point || !shared.quad )
+		{
+			if( shared.solid ) glDeleteProgram( shared.solid );
+			if( shared.wire )  glDeleteProgram( shared.wire );
+			if( shared.point ) glDeleteProgram( shared.point );
+			if( shared.quad )  glDeleteProgram( shared.quad );
+			shared = SharedGL();
+			return false;
+		}
 
-	// 1x1 white pixel, bound to every unused sampler so the shaders stay valid.
-	const unsigned char white[ 4 ] = { 255, 255, 255, 255 };
-	glGenTextures( 1, &whiteTexture );
-	glBindTexture( GL_TEXTURE_2D, whiteTexture );
-	glTexImage2D( GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white );
-	glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
-	glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
-	glBindTexture( GL_TEXTURE_2D, 0 );
+		static const float quadVertices[] = {
+			-1.0f, -1.0f, 3.0f, -1.0f, -1.0f, 3.0f//oversized triangle, covers the screen
+		};
+		glGenVertexArrays( 1, &shared.quadVao );
+		glGenBuffers( 1, &shared.quadVbo );
+		glBindVertexArray( shared.quadVao );
+		glBindBuffer( GL_ARRAY_BUFFER, shared.quadVbo );
+		glBufferData( GL_ARRAY_BUFFER, sizeof( quadVertices ), quadVertices, GL_STATIC_DRAW );
+		glEnableVertexAttribArray( 0 );
+		glVertexAttribPointer( 0, 2, GL_FLOAT, GL_FALSE, sizeof( float ) * 2, (void*)0 );
+		glBindVertexArray( 0 );
+		glBindBuffer( GL_ARRAY_BUFFER, 0 );
 
+		// 1x1 white pixel, bound to every unused sampler so the shaders stay valid.
+		const unsigned char white[ 4 ] = { 255, 255, 255, 255 };
+		glGenTextures( 1, &shared.white );
+		glBindTexture( GL_TEXTURE_2D, shared.white );
+		glTexImage2D( GL_TEXTURE_2D, 0, GL_RGBA8, 1, 1, 0, GL_RGBA, GL_UNSIGNED_BYTE, white );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR );
+		glTexParameteri( GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR );
+		glBindTexture( GL_TEXTURE_2D, 0 );
+	}
+
+	solidProgram  = shared.solid;
+	wireProgram   = shared.wire;
+	pointProgram  = shared.point;
+	quadProgram   = shared.quad;
+	quadVao       = shared.quadVao;
+	quadVbo       = shared.quadVbo;
+	whiteTexture  = shared.white;
 	programsReady = true;
 	return true;
 }
 
 void GlbSource::ReleasePrograms()
 {
-	if( solidProgram ) glDeleteProgram( solidProgram );
-	if( wireProgram )  glDeleteProgram( wireProgram );
-	if( pointProgram ) glDeleteProgram( pointProgram );
-	if( quadProgram )  glDeleteProgram( quadProgram );
+	// Shared with the other instances on this context, see SharedGL.
 	solidProgram = wireProgram = pointProgram = quadProgram = 0;
-
-	if( quadVao ) glDeleteVertexArrays( 1, &quadVao );
-	if( quadVbo ) glDeleteBuffers( 1, &quadVbo );
-	if( whiteTexture ) glDeleteTextures( 1, &whiteTexture );
 	quadVao = quadVbo = whiteTexture = 0;
 	programsReady = false;
 }
@@ -310,15 +372,23 @@ FFResult GlbSource::InitGL( const FFGLViewportStruct* vp )
 	}
 
 	lastHostTime = (float)( hostTime / 1000.0 );
-	if( !filePath.empty() )
-		loadRequested = true;
+	{
+		std::lock_guard< std::mutex > lock( fileMutex );
+		if( !filePath.empty() )
+			loadRequested = true;
+	}
 
 	return CFFGLPlugin::InitGL( vp );
 }
 
 FFResult GlbSource::DeInitGL()
 {
-	model.Release();
+	// A parse still running keeps going; its result is dropped because
+	// InitGL raises loadRequested again.
+	model.Clear();
+	staging.Clear();
+	stagingActive    = false;
+	displayTriangles = 0;
 	ReleaseRenderTarget();
 	ReleasePrograms();
 	return FF_SUCCESS;
@@ -429,45 +499,137 @@ void GlbSource::PublishClipNames()
 
 void GlbSource::ProcessPendingLoad()
 {
-	std::string wanted;
+	//------------------------------------------------- 1. a parse has finished
+	if( loadJob.Ready() )
 	{
-		std::lock_guard< std::mutex > lock( fileMutex );
-		if( !loadRequested )
-			return;
-		loadRequested = false;
-		wanted        = filePath;
+		LoadResult result = loadJob.Take();
+		bool stale;
+		{
+			std::lock_guard< std::mutex > lock( fileMutex );
+			stale = loadRequested;//the file changed again meanwhile
+		}
+		if( !stale && !result.asset )
+		{
+			FFGLLog::LogToHost( ( "GLB Source: " + result.error ).c_str() );
+			staging.Clear();
+			stagingActive = false;
+			model.Clear();
+			loadedPath.clear();
+			publishedClipCount = -1;
+			PublishClipNames();
+		}
+		else if( !stale )
+		{
+			staging.Adopt( result.asset, result.indices );
+			stagingActive  = true;
+			stagingDensity = result.indices ? result.density : 1.0f;
+			stagingPath    = result.path;
+		}
 	}
 
-	model.Release();
-	if( wanted.empty() )
+	//---------------------------------------- 2. start the next parse, if any
+	std::string wanted;
+	bool start = false;
+	bool force = false;
+	if( !loadJob.Running() )
 	{
+		std::lock_guard< std::mutex > lock( fileMutex );
+		if( loadRequested )
+		{
+			start         = true;
+			wanted        = filePath;
+			force         = forceReload;
+			loadRequested = false;
+			forceReload   = false;
+		}
+	}
+
+	if( start && wanted.empty() )
+	{
+		staging.Clear();
+		stagingActive = false;
 		model.Clear();
 		loadedPath.clear();
 		publishedClipCount = -1;
 		PublishClipNames();
-		return;
 	}
-
-	if( !model.Load( wanted ) )
+	else if( start )
 	{
-		FFGLLog::LogToHost( ( "GLB Source: " + model.LastError() ).c_str() );
-		loadedPath.clear();
-		publishedClipCount = -1;
-		PublishClipNames();
-		return;
+		// Decimate in the same job, so a clip saved at low density shows up
+		// already simplified instead of popping from full resolution.
+		const float density = pDensity;
+		loadJob.Start( [ wanted, force, density ]() {
+			LoadResult r;
+			r.path  = wanted;
+			r.asset = GltfModel::Acquire( wanted, force, r.error );
+			if( r.asset && density < 0.999f )
+			{
+				r.indices = r.asset->Decimate( density );
+				r.density = density;
+			}
+			return r;
+		} );
 	}
 
-	model.Upload();
-	loadedPath      = wanted;
-	appliedDensity  = 1.0f;
-	animTime        = 0.0f;
+	//----------------------------------- 3. feed the GPU a slice of the model
+	if( !stagingActive || !staging.UploadStep( kUploadMsPerFrame ) )
+		return;
+
+	model.Clear();
+	model         = std::move( staging );
+	staging       = GltfModel();
+	stagingActive = false;
+
+	loadedPath     = stagingPath;
+	appliedDensity = stagingDensity;
+	animTime       = 0.0f;
 	publishedClipCount = -1;
 	PublishClipNames();
 
-	char message[ 320 ];
-	std::snprintf( message, sizeof( message ), "GLB Source: loaded %s (%d triangles, %d clips)",
-	               wanted.c_str(), (int)model.TriangleCountFull(), (int)model.Animations().size() );
+	const GltfModel::Asset& asset = *model.GetAsset();
+	char message[ 384 ];
+	std::snprintf( message, sizeof( message ), "GLB Source: loaded %s (%d triangles, %d clips, %.1f MB)",
+	               loadedPath.c_str(), (int)asset.trianglesFull, (int)asset.animations.size(),
+	               (double)asset.gpuBytes / ( 1024.0 * 1024.0 ) );
 	FFGLLog::LogToHost( message );
+}
+
+void GlbSource::UpdateDensity()
+{
+	if( !model.IsLoaded() )
+		return;
+
+	if( densityJob.Ready() )
+	{
+		std::shared_ptr< const GltfModel::IndexSet > set = densityJob.Take();
+		// The model may have been swapped while the simplifier ran.
+		if( densityJobAsset == model.GetAsset() )
+		{
+			model.ApplyIndices( set.get() );
+			appliedDensity = densityJobValue;
+		}
+		densityJobAsset.reset();
+	}
+
+	// One simplification in flight at a time: while the slider moves, the
+	// latest value is picked up as soon as the previous one lands.
+	if( densityJob.Running() || std::fabs( pDensity - appliedDensity ) <= 0.002f )
+		return;
+
+	if( pDensity >= 0.999f )
+	{
+		model.ApplyIndices( nullptr );
+		appliedDensity = pDensity;
+		return;
+	}
+
+	densityJobAsset = model.GetAsset();
+	densityJobValue = pDensity;
+	std::shared_ptr< const GltfModel::Asset > asset = densityJobAsset;
+	const float density = pDensity;
+	densityJob.Start( [ asset, density ]() {
+		return asset->Decimate( density );
+	} );
 }
 
 void GlbSource::UpdateAudio( float deltaTime )

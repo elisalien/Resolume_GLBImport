@@ -285,6 +285,7 @@ FFResult GlbSource::ProcessOpenGL( ProcessOpenGLStruct* pGL )
 	lastHostTime = now;
 
 	ProcessPendingLoad();
+	displayTriangles = model.IsLoaded() ? (int)model.TriangleCountActive() : 0;
 	UpdateAudio( deltaTime );
 
 	//---------------------------------------------------------------- motion
@@ -296,12 +297,7 @@ FFResult GlbSource::ProcessOpenGL( ProcessOpenGLStruct* pGL )
 
 	if( model.IsLoaded() )
 	{
-		//------------------------------------------------------------ density
-		if( std::fabs( pDensity - appliedDensity ) > 0.002f )
-		{
-			model.SetDensity( pDensity );
-			appliedDensity = pDensity;
-		}
+		UpdateDensity();
 
 		//---------------------------------------------------------- animation
 		if( pAnimPlay > 0.5f )
@@ -405,6 +401,7 @@ FFResult GlbSource::SetFloatParameter( unsigned int index, float value )
 		{
 			std::lock_guard< std::mutex > lock( fileMutex );
 			loadRequested = true;
+			forceReload   = true;
 		}
 		break;
 	case PID_DENSITY:       pDensity = value; break;
@@ -538,8 +535,7 @@ char* GlbSource::GetParameterDisplay( unsigned int index )
 	switch( index )
 	{
 	case PID_DENSITY:
-		std::snprintf( display, sizeof( display ), "%d tris",
-		               model.IsLoaded() ? (int)model.TriangleCountActive() : 0 );
+		std::snprintf( display, sizeof( display ), "%d tris", displayTriangles.load() );
 		return display;
 	case PID_SCALE:
 		std::snprintf( display, sizeof( display ), "%.2f", pScale );
