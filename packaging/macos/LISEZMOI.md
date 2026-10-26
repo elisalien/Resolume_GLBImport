@@ -30,7 +30,7 @@ Ferme Resolume avant : le scan des plugins ne se fait qu'au démarrage.
 
 ### Compiler soi-même
 
-Le code source est sur https://github.com/elisalien/Resolume_GTBImport
+Le code source est sur https://github.com/elisalien/Resolume_GLBImport
 
 ```bash
 cmake -B build -DCMAKE_BUILD_TYPE=Release
